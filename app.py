@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -51,6 +52,20 @@ st.set_page_config(
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("MONITOR_DATA_DIR") or APP_DIR)
 ARQUIVO_DADOS = DATA_DIR / "dados_monitor_g1.json"
+SEMENTE = APP_DIR / "dados_iniciais.json"  # configuração inicial versionada (sem segredos)
+EM_NUVEM = APP_DIR.as_posix().startswith("/mount/src")  # Streamlit Community Cloud
+# chave interna -> nome do segredo (Secrets da plataforma ou variável de ambiente)
+SEGREDOS = {
+    "telegram_token": "TELEGRAM_TOKEN",
+    "telegram_chat_id": "TELEGRAM_CHAT_ID",
+    "instagram_sessionid": "INSTAGRAM_SESSIONID",
+}
+# O que vale a pena versionar/exportar. Nunca inclui segredos nem histórico.
+CHAVES_CONFIG = (
+    "cidades", "urls", "perfis_instagram", "perfis_x", "paginas", "logradouros",
+    "rodovias", "cidades_excluidas", "nomes_ambiguos", "instancias_nitter",
+    "bridges_instagram", "intervalo_auto", "automacao_ativa", "telegram_preview",
+)
 PASTAS_ASSETS = [DATA_DIR / "assets", APP_DIR / "assets"]
 
 FUSO_BR = timezone(timedelta(hours=-3))  # Brasil não tem horário de verão
@@ -137,6 +152,17 @@ RODOVIAS_REGIONAIS = [
     "Alfredo Rolim de Moura",
 ]
 
+# Nomes de rua/rodovia que existem em muitas cidades (ou são nomes comuns). Sozinhos NÃO
+# bastam para aceitar uma notícia; só valem junto de uma cidade cadastrada. Editável na aba Fontes.
+AMBIGUOS_PADRAO = [
+    "Avenida Brasil", "Emancipação", "Uberaba", "Rua Beatriz", "Sete de Setembro",
+    "Treze de Maio", "9 de Julho", "XV de Novembro", "26 de Março", "Mário Covas",
+    "Vital Brasil", "Barão do Rio Branco", "Marechal Deodoro", "Avenida da República",
+    "Expedicionários", "Major Benjamin", "Carlos de Campos", "Adhemar de Barros",
+    "Conselheiro Rodrigues Alves", "Armando Salles de Oliveira", "João Manoel",
+    "Presidente Dutra", "BR-116", "Rodoanel", "Ayrton Senna",
+]
+
 PADRAO_DADOS = {
     "cidades": [
         "Mogi das Cruzes", "Suzano", "Itaquaquecetuba", "Arujá",
@@ -156,6 +182,7 @@ PADRAO_DADOS = {
     "paginas": [],  # {"nome","url","seletor","baseline_feito"}
     "logradouros": list(LOGRADOUROS_URBANOS),  # ruas, avenidas e bairros
     "rodovias": list(RODOVIAS_REGIONAIS),
+    "nomes_ambiguos": list(AMBIGUOS_PADRAO),
     # Espelhos Nitter são testados em ordem; o primeiro que responder vale.
     # Instâncias públicas caem e mudam com frequência: edite na aba Fontes.
     "instancias_nitter": [
@@ -222,7 +249,8 @@ def contem(texto_norm: str, termo: str) -> bool:
 
 # Apelidos só valem se a cidade canônica estiver cadastrada (regex sobre texto normalizado).
 APELIDOS_CIDADES = {
-    "mogi das cruzes": (r"\bmogi\b(?!\s+(?:guacu|mirim))",),
+    # "Mogi" sozinho vale, mas não "Mogi Guaçu"/"Mogi-Mirim" (com espaço ou hífen)
+    "mogi das cruzes": (r"\bmogi\b(?![\s-]+(?:guacu|mirim))",),
     "itaquaquecetuba": (r"\bitaqua\b",),
 }
 
@@ -247,14 +275,16 @@ def _achar_termo(texto_norm: str, termos) -> str | None:
   return mapa[achado.group(0)] if achado else None
 
 
-def _achar_cidade(texto_norm: str, cidades: list[str]) -> str | None:
+def _achar_cidade(texto_norm: str, cidades: list[str]) -> tuple[str, str] | None:
+  """Devolve (cidade cadastrada, trecho que casou)."""
   direta = _achar_termo(texto_norm, cidades)
   if direta:
-    return direta
+    return direta, _norm(direta).strip()
   for cidade in cidades:
     for padrao in APELIDOS_CIDADES.get(_norm(cidade).strip(), ()):
-      if re.search(padrao, texto_norm):
-        return cidade
+      achado = re.search(padrao, texto_norm)
+      if achado:
+        return cidade, achado.group(0)
   return None
 
 
@@ -266,31 +296,71 @@ def classificar_ocorrencia(texto: str) -> str:
   return CAT_GERAL
 
 
-def identificar_local(texto: str, cidades: list[str],
-                      logradouros: list[str] | None = None,
-                      rodovias: list[str] | None = None,
-                      excluidas: list[str] | None = None) -> str | None:
-  """Filtro geográfico ESTRITO: só devolve local se o texto citar, explicitamente,
-  uma cidade, rua/bairro ou rodovia cadastrados. Nada de "Alto Tietê" genérico.
+# Trechos que PARECEM uma cidade da região, mas são outra coisa (texto já normalizado).
+RUIDOS_GEOGRAFICOS = tuple(re.compile(p) for p in (
+    r"\bsuzb\d*\b",                                         # ação da empresa Suzano
+    r"\bsuzano\s+(?:s\.?\s?a\b|papel|celulose|holding)",    # Suzano S.A., Suzano Papel e Celulose
+    r"\b(?:acoes?|papeis)\s+(?:da|de)\s+suzano\b",
+    r"\bsanta isabel\s+do\s+\w+",                           # Santa Isabel do Pará, do Ivaí…
+    r"\bhospital\s+santa\s+isabel\b",
+))
+# Notícia de mercado/indústria: "Suzano" aí é a empresa, não a cidade.
+CONTEXTO_EMPRESA_SUZANO = re.compile(
+    r"\b(?:celulose|ebitda|suzb\d*|dividendos?|ibovespa|b3|bolsa de valores)\b")
 
-  Cidade cadastrada vale sempre. Rua ou rodovia sem cidade é descartada quando o
-  texto cita uma cidade de fora da região (ver `cidades_excluidas`).
+
+def _limpar_para_local(texto: str) -> str:
+  """Texto normalizado, sem os trechos que enganam o filtro geográfico."""
+  bruto = re.sub(r"\bPOA\b", " ", texto)  # sigla de Porto Alegre, não a cidade de Poá
+  norm = _norm(bruto)
+  empresa = bool(CONTEXTO_EMPRESA_SUZANO.search(norm))  # antes de apagar o código da ação
+  for padrao in RUIDOS_GEOGRAFICOS:
+    norm = padrao.sub(" ", norm)
+  if empresa:
+    norm = re.sub(r"\bsuzano\b", " ", norm)
+  return norm
+
+
+def identificar_local_detalhe(texto: str, cidades: list[str],
+                              logradouros: list[str] | None = None,
+                              rodovias: list[str] | None = None,
+                              excluidas: list[str] | None = None,
+                              ambiguos: list[str] | None = None) -> tuple[str, str] | None:
+  """Filtro geográfico ESTRITO. Devolve (rótulo do local, trecho que casou) ou None.
+
+  Cidade cadastrada vale sempre. Rua/bairro/rodovia valem sozinhos, exceto os "nomes
+  ambíguos" (Avenida Brasil, Dutra, Rodoanel…), que só contam junto de uma cidade.
+  Rua ou rodovia sem cidade é descartada se o texto citar uma cidade de fora.
   """
-  texto_norm = _norm(texto)
+  texto_norm = _limpar_para_local(texto)
   cidade = _achar_cidade(texto_norm, cidades)
   if cidade:
     return cidade
+  amb = {_norm(a).strip() for a in (AMBIGUOS_PADRAO if ambiguos is None else ambiguos)}
+
+  def validos(lista) -> tuple[str, ...]:
+    return tuple(t for t in lista if _norm(t).strip() not in amb)
+
   achado = None
-  rua = _achar_termo(texto_norm, LOGRADOUROS_URBANOS if logradouros is None else logradouros)
+  rua = _achar_termo(texto_norm, validos(LOGRADOUROS_URBANOS if logradouros is None else logradouros))
   if rua:
-    achado = f"Alto Tietê ({rua})"
+    achado = (f"Alto Tietê ({rua})", _norm(rua).strip())
   else:
-    rodovia = _achar_termo(texto_norm, RODOVIAS_REGIONAIS if rodovias is None else rodovias)
+    rodovia = _achar_termo(texto_norm, validos(RODOVIAS_REGIONAIS if rodovias is None else rodovias))
     if rodovia:
-      achado = f"Alto Tietê ({rodovia})"
+      achado = (f"Alto Tietê ({rodovia})", _norm(rodovia).strip())
   if achado and excluidas and _achar_termo(texto_norm, excluidas):
     return None
   return achado
+
+
+def identificar_local(texto: str, cidades: list[str],
+                      logradouros: list[str] | None = None,
+                      rodovias: list[str] | None = None,
+                      excluidas: list[str] | None = None,
+                      ambiguos: list[str] | None = None) -> str | None:
+  achado = identificar_local_detalhe(texto, cidades, logradouros, rodovias, excluidas, ambiguos)
+  return achado[0] if achado else None
 
 
 def gerar_id_unico(texto: str, url: str) -> str:
@@ -344,6 +414,15 @@ def nome_do_dominio(url: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 # 3. Persistência
 # ──────────────────────────────────────────────────────────────────────────
+def ler_segredo(nome: str) -> str:
+  """Secrets do Streamlit; se não houver, variável de ambiente; senão vazio."""
+  try:
+    valor = st.secrets.get(nome, "")
+  except Exception:  # sem secrets.toml (execução local)
+    valor = ""
+  return str(valor or os.environ.get(nome, "")).strip()
+
+
 class Store:
   """Fonte única de verdade, compartilhada por todas as sessões e pela thread.
 
@@ -354,6 +433,7 @@ class Store:
     self.caminho = caminho
     self.lock = threading.RLock()
     self.feeds: dict[str, ResultadoFeed] = {}  # estado em memória (não persiste)
+    self.externos: set[str] = set()  # chaves que vêm dos Secrets (nunca gravadas em disco)
     self.data = self._carregar()
     self._ids: list[str] = list(self.data["ids_vistos"])
     self._ids_set: set[str] = set(self._ids)
@@ -362,21 +442,30 @@ class Store:
 
   def _carregar(self) -> dict:
     dados = copy.deepcopy(PADRAO_DADOS)
-    if self.caminho.exists():
+    # Sem arquivo de trabalho (ex.: nuvem após reinício), parte da semente do repositório.
+    arquivo = self.caminho if self.caminho.exists() else (SEMENTE if SEMENTE.exists() else None)
+    if arquivo:
       try:
-        dados.update(json.loads(self.caminho.read_text(encoding="utf-8")))
+        dados.update(json.loads(arquivo.read_text(encoding="utf-8")))
       except (OSError, ValueError) as erro:
         backup = self.caminho.with_name(
             f"{self.caminho.stem}.corrompido-{int(time.time())}.json"
         )
         try:
-          self.caminho.replace(backup)
+          arquivo.replace(backup) if arquivo == self.caminho else None
         except OSError:
           pass
         log.error("JSON ilegível (%s). Backup em %s", erro, backup.name)
     for obsoleta in ("itens_rss_proprio", "perfis_facebook", "bridges_facebook",
                      "facebook_token"):  # recursos removidos
       dados.pop(obsoleta, None)
+    # Segredos da plataforma (Secrets/variáveis de ambiente) vencem o arquivo e
+    # nunca são gravados de volta nele.
+    for chave, nome in SEGREDOS.items():
+      valor = ler_segredo(nome)
+      if valor:
+        dados[chave] = valor
+        self.externos.add(chave)
     return dados
 
   def _registrar_id(self, id_unico: str | None) -> bool:
@@ -402,7 +491,10 @@ class Store:
   def salvar(self) -> None:
     with self.lock:
       self.data["ids_vistos"] = self._ids[-LIMITE_IDS:]
-      conteudo = json.dumps(self.data, ensure_ascii=False, indent=2)
+      em_disco = dict(self.data)
+      for chave in self.externos:  # segredo da plataforma nunca vai para o arquivo
+        em_disco[chave] = ""
+      conteudo = json.dumps(em_disco, ensure_ascii=False, indent=2)
       temporario = self.caminho.with_name(self.caminho.name + ".tmp")
       for tentativa in range(3):
         try:
@@ -601,8 +693,12 @@ def _data_publicacao(entrada) -> datetime | None:
 def _entrada_para_item(entrada, url_feed: str) -> dict:
   link = (entrada.get("link") or url_feed).strip()
   fonte = (entrada.get("source") or {}).get("title") or nome_do_dominio(link)
-  resumo_html = entrada.get("summary", "")
-  resumo = BeautifulSoup(resumo_html, "html.parser").get_text(" ", strip=True)
+  sopa = BeautifulSoup(entrada.get("summary", ""), "html.parser")
+  # listas (<ul>/<ol>) são "veja também"/cobertura relacionada de outras matérias,
+  # que podem citar outras cidades e enganar o filtro geográfico
+  for lista in sopa(["ul", "ol", "script", "style"]):
+    lista.decompose()
+  resumo = sopa.get_text(" ", strip=True)
   return {
       "titulo": (entrada.get("title") or "").strip(),
       "link": link,
@@ -1059,7 +1155,7 @@ def consultar_fonte(chave: str, store: "Store", forcar: bool = False) -> Resulta
 
 
 def novo_alerta(*, id_unico, cidade, categoria, fonte, titulo, resumo, url,
-                quando: datetime | None = None) -> dict:
+                quando: datetime | None = None, casou_com: str = "") -> dict:
   momento = (quando or datetime.now(FUSO_BR)).astimezone(FUSO_BR)
   return {
       "id_unico": id_unico,
@@ -1071,6 +1167,7 @@ def novo_alerta(*, id_unico, cidade, categoria, fonte, titulo, resumo, url,
       "titulo": titulo,
       "resumo": resumo,
       "url": url,
+      "casou_com": casou_com,  # trecho do texto que passou no filtro geográfico
   }
 
 
@@ -1163,9 +1260,26 @@ def _fechar_varredura(store: Store, resumo: ResumoVarredura, novos: list[dict]):
   store.salvar()
 
 
-def _texto_item(item: dict) -> str:
+def _texto_bruto(item: dict) -> str:
+  """Texto como veio da fonte. É a base do id_unico (preserva ids já registrados)."""
   texto = item.get("texto_completo") or f"{item['titulo']} - {item['resumo']}"
   return texto.strip()
+
+
+def _sem_veiculo(texto: str, fonte: str) -> str:
+  """Tira o nome do veículo no fim ("Título - Veículo"), que pode conter uma cidade."""
+  if not fonte:
+    return texto.strip()
+  return re.sub(rf"\s*[-–—|]?\s*{re.escape(fonte)}\s*$", "", texto, flags=re.I).strip()
+
+
+def _texto_item(item: dict) -> str:
+  """Texto usado nos filtros (cidade, categoria) e no resumo do alerta."""
+  if item.get("texto_completo"):
+    return item["texto_completo"].strip()
+  fonte = item.get("fonte", "")
+  partes = [_sem_veiculo(item["titulo"], fonte), _sem_veiculo(item["resumo"], fonte)]
+  return " - ".join(p for p in partes if p)
 
 
 def _linha_de_base(store: Store, res: ResultadoFeed) -> None:
@@ -1176,7 +1290,7 @@ def _linha_de_base(store: Store, res: ResultadoFeed) -> None:
     return
   for item in res.itens:
     if item["publicado"] is None:
-      store.marcar_visto(gerar_id_unico(_texto_item(item), item["link"]))
+      store.marcar_visto(gerar_id_unico(_texto_bruto(item), item["link"]))
   cfg["baseline_feito"] = True
 
 
@@ -1191,23 +1305,25 @@ def avaliar_itens(store: Store, itens: list[dict], cidades: list[str],
   logradouros = store.data.get("logradouros")
   rodovias = store.data.get("rodovias")
   excluidas = store.data.get("cidades_excluidas")
+  ambiguos = store.data.get("nomes_ambiguos")
   for item in itens:
     if not item_recente(item["publicado"], not exige_data):
       continue
     texto = _texto_item(item)
     if len(texto) <= 15:
       continue
-    local = identificar_local(texto, cidades, logradouros, rodovias, excluidas)
-    if not local:  # genérico, de outra praça ou sem menção explícita: descarta
+    achado = identificar_local_detalhe(texto, cidades, logradouros, rodovias, excluidas, ambiguos)
+    if not achado:  # genérico, de outra praça ou sem menção explícita: descarta
       continue
-    id_unico = gerar_id_unico(item.get("chave_id") or texto, item["link"])
+    local, trecho = achado
+    id_unico = gerar_id_unico(item.get("chave_id") or _texto_bruto(item), item["link"])
     if not store.marcar_visto(id_unico):
       continue
     novos.append(novo_alerta(
         id_unico=id_unico, cidade=local,
         categoria=classificar_ocorrencia(texto), fonte=item["fonte"],
         titulo=item["titulo"], resumo=texto[:350], url=item["link"],
-        quando=item["publicado"],
+        quando=item["publicado"], casou_com=trecho,
     ))
 
 
@@ -1534,10 +1650,13 @@ def _card_html(alerta: dict) -> str:
   classe_cat = "urgente" if categoria == CAT_SEGURANCA else "info"
   marcador = '<span class="g1-urgente"></span>' if categoria == CAT_SEGURANCA else ""
   titulo = alerta.get("titulo") or alerta.get("resumo", "")[:90] or "Sem título"
+  motivo = alerta.get("casou_com")
+  chip_motivo = (f'<span class="g1-chip" title="Trecho que passou no filtro geográfico">'
+                 f'🔎 {esc(motivo)}</span>' if motivo else "")
   return _html(f"""
     <div class="g1-meta">{marcador}
       <span class="g1-chip {classe_cat}">{esc(categoria)}</span>
-      <span class="g1-chip">🏙️ {esc(alerta.get("cidade", ""))}</span>
+      <span class="g1-chip">🏙️ {esc(alerta.get("cidade", ""))}</span>{chip_motivo}
       <span class="g1-chip">📰 {esc(alerta.get("fonte", "Portal de Notícias"))}</span>
       <span class="g1-time">⏰ {esc(alerta.get("horario", ""))}</span>
     </div>
@@ -1696,6 +1815,7 @@ def _cartao_fonte(store: Store, chave: str, titulo: str, detalhe: str = "",
         local = identificar_local(
             _texto_item(item), store.data["cidades"], store.data["logradouros"],
             store.data["rodovias"], store.data["cidades_excluidas"],
+            store.data["nomes_ambiguos"],
         )
         selo = "🟢" if item_recente(item["publicado"], not res.exige_data) else "⚪"
         nome = html.escape(item["titulo"] or "(sem título)")
@@ -1819,19 +1939,23 @@ def _sub_instagram(store: Store) -> None:
     _cartao_fonte(store, f"ig:{usuario}", f"@{usuario}", f"https://www.instagram.com/{usuario}/",
                   (store.remover_item, "perfis_instagram", usuario))
   with st.expander("🔐 Estabilidade: cookie de sessão e pontes RSS"):
-    with st.form("form_ig_sessao"):
-      sessao = st.text_input(
-          "Cookie “sessionid” (opcional)", value=store.data.get("instagram_sessionid", ""),
-          type="password",
-          help="No navegador logado: F12 → Aplicativo (Application) → Cookies → instagram.com → "
-               "copie o valor de sessionid. Use uma conta secundária: o Instagram pode restringir "
-               "contas usadas em automação. O cookie expira e precisa ser renovado de tempos em tempos.")
-      if st.form_submit_button("Salvar cookie"):
-        with store.lock:
-          store.data["instagram_sessionid"] = sessao.strip()
-          store.salvar()
-        st.success("Cookie salvo. Clique em “Testar” em um perfil para validar.")
-    st.caption("O cookie fica no arquivo dados_monitor_g1.json. Não compartilhe esse arquivo.")
+    if "instagram_sessionid" in store.externos:
+      st.success("🔒 O cookie de sessão vem dos Secrets da plataforma (INSTAGRAM_SESSIONID).")
+    else:
+      with st.form("form_ig_sessao"):
+        sessao = st.text_input(
+            "Cookie “sessionid” (opcional)", value=store.data.get("instagram_sessionid", ""),
+            type="password",
+            help="No navegador logado: F12 → Aplicativo (Application) → Cookies → instagram.com → "
+                 "copie o valor de sessionid. Use uma conta secundária: o Instagram pode restringir "
+                 "contas usadas em automação. O cookie expira e precisa ser renovado de tempos em tempos.")
+        if st.form_submit_button("Salvar cookie"):
+          with store.lock:
+            store.data["instagram_sessionid"] = sessao.strip()
+            store.salvar()
+          st.success("Cookie salvo. Clique em “Testar” em um perfil para validar.")
+      st.caption("O cookie fica no arquivo dados_monitor_g1.json. Não compartilhe esse arquivo. "
+                 "Na nuvem, use os Secrets (INSTAGRAM_SESSIONID).")
     with st.form("form_ponte_ig", clear_on_submit=True):
       nova = st.text_input("Nova ponte RSS (reserva)", placeholder="https://seu-rsshub/instagram/user/{perfil}",
                            help="Usada se o acesso direto falhar. Use {perfil} no lugar do nome do perfil.")
@@ -1904,6 +2028,12 @@ def _sub_locais(store: Store) -> None:
       a, b = st.columns(2)
       ruas = a.text_area("Ruas, avenidas e bairros", value="\n".join(store.data["logradouros"]), height=300)
       rodovias = b.text_area("Rodovias e estradas", value="\n".join(store.data["rodovias"]), height=300)
+      amb = st.text_area(
+          "Nomes ambíguos (só valem junto de uma cidade cadastrada)",
+          value="\n".join(store.data["nomes_ambiguos"]), height=120,
+          help="Nomes que existem em várias cidades ou são palavras comuns (Avenida Brasil, "
+               "Dutra, Rodoanel…). Sozinhos, não bastam para aceitar uma notícia. Remova um nome "
+               "daqui se quiser que ele valha sozinho.")
       fora = st.text_area(
           "Cidades de fora (descartam posts que citam só rua/rodovia)",
           value="\n".join(store.data["cidades_excluidas"]), height=120)
@@ -1911,6 +2041,7 @@ def _sub_locais(store: Store) -> None:
         with store.lock:
           store.data["logradouros"] = _linhas(ruas)
           store.data["rodovias"] = _linhas(rodovias)
+          store.data["nomes_ambiguos"] = _linhas(amb)
           store.data["cidades_excluidas"] = _linhas(fora)
           store.salvar()
         st.success(f"Salvo: {len(store.data['logradouros'])} ruas/bairros e {len(store.data['rodovias'])} rodovias.")
@@ -1962,22 +2093,50 @@ def _status_automacao_corpo() -> None:
                + (f", {len(resumo.erros)} falha(s)" if resumo.erros else ""))
 
 
+def exportar_configuracao(store: Store) -> str:
+  with store.lock:
+    cfg = {k: copy.deepcopy(store.data[k]) for k in CHAVES_CONFIG}
+  for pagina in cfg["paginas"]:
+    pagina["baseline_feito"] = False  # num reinício os ids vistos se perdem: refazer a linha de base
+  return json.dumps(cfg, ensure_ascii=False, indent=2)
+
+
+def exigir_senha() -> None:
+  """Se existir o segredo SENHA_PAINEL, o painel só abre depois de digitá-la."""
+  senha = ler_segredo("SENHA_PAINEL")
+  if not senha or st.session_state.get("autenticado"):
+    return
+  with st.form("form_login"):
+    digitada = st.text_input("Senha do painel", type="password")
+    if st.form_submit_button("Entrar", type="primary"):
+      if hmac.compare_digest(digitada.encode("utf-8"), senha.encode("utf-8")):
+        st.session_state["autenticado"] = True
+        st.rerun()
+      st.error("Senha incorreta.")
+  st.stop()
+
+
 def aba_telegram(store: Store, auto: Automacao) -> None:
   col_tg, col_auto = st.columns(2)
 
   with col_tg:
     st.subheader("📲 Bot do Telegram")
+    externo = "telegram_token" in store.externos
+    if externo:
+      st.success("🔒 Token e Chat ID vêm dos Secrets da plataforma (TELEGRAM_TOKEN e TELEGRAM_CHAT_ID).")
     with st.form("form_telegram"):
-      token = st.text_input("Token do bot", value=store.data["telegram_token"], type="password")
-      chat = st.text_input("Chat ID", value=store.data["telegram_chat_id"])
+      if not externo:
+        token = st.text_input("Token do bot", value=store.data["telegram_token"], type="password")
+        chat = st.text_input("Chat ID", value=store.data["telegram_chat_id"])
       preview = st.checkbox(
           "Mostrar pré-visualização (cartão) do link nas mensagens",
           value=bool(store.data.get("telegram_preview")),
           help="Desligado, a mensagem fica enxuta: só título, resumo, local e o link oculto.")
       if st.form_submit_button("Salvar configurações", type="primary"):
         with store.lock:
-          store.data["telegram_token"] = token.strip()
-          store.data["telegram_chat_id"] = chat.strip()
+          if not externo:
+            store.data["telegram_token"] = token.strip()
+            store.data["telegram_chat_id"] = chat.strip()
           store.data["telegram_preview"] = bool(preview)
           store.salvar()
         st.success("Configurações salvas.")
@@ -1987,7 +2146,9 @@ def aba_telegram(store: Store, auto: Automacao) -> None:
           "✅ <b>Central de Plantão g1 Alto Tietê</b>\nConexão com o Telegram funcionando.",
       )
       (st.success if ok else st.error)("Mensagem de teste enviada." if ok else f"Não enviado: {msg}")
-    st.caption("O token fica no arquivo dados_monitor_g1.json. Não compartilhe esse arquivo.")
+    if not externo:
+      st.caption("O token fica no arquivo dados_monitor_g1.json. Não compartilhe esse arquivo. "
+                 "Na nuvem, use os Secrets.")
 
   with col_auto:
     st.subheader("🔄 Varredura automática")
@@ -2002,10 +2163,20 @@ def aba_telegram(store: Store, auto: Automacao) -> None:
         _mostrar_resumo(auto.executar())
 
   st.divider()
-  with st.popover("⏻ Encerrar aplicativo"):
-    st.caption("Para o servidor e a varredura automática. Para voltar, abra o aplicativo de novo.")
-    if st.button("Encerrar agora", key="btn_encerrar"):
-      os._exit(0)
+  st.subheader("💾 Configuração")
+  st.caption(
+      "Na nuvem, o disco é apagado a cada reinício: o que você muda aqui some. Para tornar permanente, "
+      "baixe a configuração e envie ao GitHub com o nome dados_iniciais.json. O arquivo não leva "
+      "segredos nem histórico."
+  )
+  st.download_button("⬇️ Baixar configuração (dados_iniciais.json)",
+                     data=exportar_configuracao(store), file_name="dados_iniciais.json",
+                     mime="application/json", key="btn_exportar")
+  if not EM_NUVEM:
+    with st.popover("⏻ Encerrar aplicativo"):
+      st.caption("Para o servidor e a varredura automática. Para voltar, abra o aplicativo de novo.")
+      if st.button("Encerrar agora", key="btn_encerrar"):
+        os._exit(0)
 
 
 def main() -> None:
@@ -2013,6 +2184,7 @@ def main() -> None:
   auto = obter_automacao()
   st.markdown(f"<style>{_css(tema_atual())}</style>", unsafe_allow_html=True)
   cabecalho(auto)
+  exigir_senha()
 
   t1, t2, t3 = st.tabs([
       "📡 Feed em tempo real",
