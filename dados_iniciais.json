@@ -24,7 +24,11 @@
     "https://news.google.com/rss/search?q=Suzano+when:1d&hl=pt-BR&gl=BR&ceid=BR:pt-419",
     "https://news.google.com/rss/search?q=%22Alto+Tiet%C3%AA%22+when:1d&hl=pt-BR&gl=BR&ceid=BR:pt-419",
     "https://www.diariodesuzano.com.br/rss",
-    "https://www.odiariodemogi.net.br/rss"
+    "https://www.odiariodemogi.net.br/rss",
+    "https://hojediario.com/feed",
+    "https://noticiasdemogi.com.br/feed/",
+    "https://www.gov.br/rss.xml",
+    "https://sp.agenciasebrae.com.br/feed/"
   ],
   "perfis_instagram": [
     "diariodesuzano",
