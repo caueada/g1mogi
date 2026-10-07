@@ -50,6 +50,8 @@ st.set_page_config(
 # 1. Configuração e constantes
 # ──────────────────────────────────────────────────────────────────────────
 APP_DIR = Path(__file__).resolve().parent
+# Identifica a versão do código. Muda a cada edição do arquivo e separa os caches (ver obter_store).
+APP_VERSAO = hashlib.md5(Path(__file__).read_bytes()).hexdigest()[:12]
 DATA_DIR = Path(os.environ.get("MONITOR_DATA_DIR") or APP_DIR)
 ARQUIVO_DADOS = DATA_DIR / "dados_monitor_g1.json"
 SEMENTE = APP_DIR / "dados_iniciais.json"  # configuração inicial versionada (sem segredos)
@@ -59,12 +61,15 @@ SEGREDOS = {
     "telegram_token": "TELEGRAM_TOKEN",
     "telegram_chat_id": "TELEGRAM_CHAT_ID",
     "instagram_sessionid": "INSTAGRAM_SESSIONID",
+    "apify_token": "APIFY_TOKEN",
 }
 # O que vale a pena versionar/exportar. Nunca inclui segredos nem histórico.
 CHAVES_CONFIG = (
     "cidades", "urls", "perfis_instagram", "perfis_x", "paginas", "logradouros",
     "rodovias", "cidades_excluidas", "nomes_ambiguos", "instancias_nitter",
     "bridges_instagram", "intervalo_auto", "automacao_ativa", "telegram_preview",
+    "apify_limite_perfil", "apify_limite_dia", "apify_intervalo_min",
+    "termos_categorias", "termos_bloqueados", "exigir_palavra_chave",
 )
 PASTAS_ASSETS = [DATA_DIR / "assets", APP_DIR / "assets"]
 
@@ -104,21 +109,46 @@ CATEGORIAS = [CAT_SEGURANCA, CAT_TRANSITO, CAT_SERVICOS, CAT_GERAL]
 
 TERMOS_CATEGORIAS = {
     CAT_SEGURANCA: [
-        "incêndio", "tiros", "arma", "homicídio", "preso", "operação",
-        "polícia", "bombeiros", "acidente", "colisão", "atropelamento",
-        "roubo", "furto", "delegacia", "morto", "baleado",
+        "incêndio", "incêndios", "tiros", "tiroteio", "arma de fogo", "arma", "homicídio",
+        "assassinato", "assassinado", "preso", "presos", "presa", "prisão", "operação policial",
+        "polícia", "policial", "policiais", "bombeiros", "samu", "resgate", "acidente",
+        "acidentes", "colisão", "capotamento", "atropelamento", "atropelado", "roubo", "assalto",
+        "furto", "delegacia", "morto", "mortos", "morre", "morreu", "baleado", "esfaqueado",
+        "ferido", "feridos", "vítima", "vítimas", "explosão", "desabamento", "afogamento",
+        "sequestro", "tráfico", "apreensão",
     ],
     CAT_TRANSITO: [
-        "trânsito", "interdição", "congestionamento", "rodovia", "marginal",
-        "trem", "cptm", "estação", "linha 11", "linha 12", "linha 13",
-        "acidente na rodovia", "bloqueio",
+        "trânsito", "interdição", "interditada", "interditado", "congestionamento", "lentidão",
+        "rodovia", "marginal", "bloqueio", "bloqueada", "desvio", "trem", "trens", "cptm",
+        "viamobilidade", "estação de trem", "linha 11", "linha 12", "linha 13",
     ],
     CAT_SERVICOS: [
-        "água", "sabesp", "luz", "energia", "edp", "falta", "escola", "posto",
-        "saúde", "UPA", "hospital", "greve", "paralisação", "buraco",
-        "enchente", "alagamento", "falta de energia",
+        "sabesp", "falta de água", "sem água", "vazamento", "rompimento", "adutora",
+        "falta de energia", "sem energia", "queda de energia", "apagão", "edp", "greve",
+        "paralisação", "UPA", "hospital", "pronto-socorro", "posto de saúde", "vacinação",
+        "surto", "dengue", "alagamento", "enchente", "temporal", "chuva forte",
+        "queda de árvore", "defesa civil", "deslizamento", "buraco", "escola interditada",
+        "aulas suspensas",
     ],
 }
+
+# Assuntos que nunca interessam ao plantão: descartam o texto mesmo que cite uma cidade.
+TERMOS_BLOQUEADOS_PADRAO = [
+    "horóscopo", "mega-sena", "mega sena", "lotofácil", "loteria", "loterias", "quina",
+    "novela", "bbb", "big brother", "escalação", "palpite", "palpites",
+]
+
+# Para cruzar feeds de veículos (RSS) com feeds de busca (Google News).
+STOPWORDS_TITULO = frozenset(
+    "a o as os um uma uns umas de da do das dos em na no nas nos por para com sem sob sobre ao "
+    "aos e ou que se mais apos ate entre foi sao tem ser ter ja nao apos ainda tambem".split()
+)
+SIMILARIDADE_TITULO = 0.7  # Jaccard entre as palavras dos títulos
+JANELA_ASSINATURA_S = 6 * 3600  # por quanto tempo lembrar das matérias já enviadas
+LIMITE_ASSINATURAS = 400
+# Quem vence quando a mesma matéria vem de fontes diferentes (menor número ganha).
+PRIORIDADE_ORIGEM = {"rss": 0, "pagina": 1, "social": 2, "busca": 3}
+
 
 LOGRADOUROS_URBANOS = [
     "Narciso Yague Guimarães", "Carlos Ferreira Lopes",
@@ -179,10 +209,21 @@ PADRAO_DADOS = {
     # Pontes RSS opcionais (reserva do acesso direto). Use {perfil} no endereço.
     "bridges_instagram": [],
     "instagram_sessionid": "",  # cookie de sessão opcional (conta secundária)
+    # Apify (serviço de leitura do Instagram; pago por uso)
+    "apify_token": "",
+    "apify_limite_perfil": 5,   # posts por perfil em cada leitura
+    "apify_limite_dia": 150,    # teto diário de posts cobrados
+    "apify_intervalo_min": 20,  # minutos entre leituras
+    "apify_uso": {"dia": "", "posts": 0},
     "paginas": [],  # {"nome","url","seletor","baseline_feito"}
     "logradouros": list(LOGRADOUROS_URBANOS),  # ruas, avenidas e bairros
     "rodovias": list(RODOVIAS_REGIONAIS),
     "nomes_ambiguos": list(AMBIGUOS_PADRAO),
+    # Filtro de palavras: o texto precisa ter alguma palavra-chave e nenhuma bloqueada
+    "termos_categorias": copy.deepcopy(TERMOS_CATEGORIAS),
+    "termos_bloqueados": list(TERMOS_BLOQUEADOS_PADRAO),
+    "exigir_palavra_chave": True,
+    "assinaturas": [],  # [época, títulos normalizados] das matérias já enviadas (cruzamento de fontes)
     # Espelhos Nitter são testados em ordem; o primeiro que responder vale.
     # Instâncias públicas caem e mudam com frequência: edite na aba Fontes.
     "instancias_nitter": [
@@ -288,12 +329,27 @@ def _achar_cidade(texto_norm: str, cidades: list[str]) -> tuple[str, str] | None
   return None
 
 
-def classificar_ocorrencia(texto: str) -> str:
+def classificar_detalhe(texto: str, termos: dict | None = None) -> tuple[str, str]:
+  """(categoria, palavra-chave que casou). Sem palavra-chave: (CAT_GERAL, "")."""
   texto_norm = _norm(texto)
-  for categoria, termos in TERMOS_CATEGORIAS.items():
-    if any(contem(texto_norm, t) for t in termos):
-      return categoria
-  return CAT_GERAL
+  for categoria, lista in (TERMOS_CATEGORIAS if termos is None else termos).items():
+    for termo in lista:
+      if contem(texto_norm, termo):
+        return categoria, _norm(termo).strip()
+  return CAT_GERAL, ""
+
+
+def classificar_ocorrencia(texto: str, termos: dict | None = None) -> str:
+  return classificar_detalhe(texto, termos)[0]
+
+
+def bloqueado_por(texto: str, bloqueados: list[str] | None) -> str:
+  """Primeira palavra bloqueada encontrada no texto ("" se nenhuma)."""
+  texto_norm = _norm(texto)
+  for termo in bloqueados or []:
+    if contem(texto_norm, termo):
+      return termo
+  return ""
 
 
 # Trechos que PARECEM uma cidade da região, mas são outra coisa (texto já normalizado).
@@ -548,9 +604,22 @@ class Store:
 
 
 @st.cache_resource(show_spinner=False)
-def obter_store() -> Store:
+def _geracao_ativa() -> dict:
+  """Registro compartilhado entre versões do código. NÃO altere o corpo desta função:
+  se ela mudar, o cache a recria e as threads antigas deixam de ser avisadas."""
+  return {"versao": None}
+
+
+@st.cache_resource(show_spinner=False)
+def _criar_store(versao: str) -> Store:
   _configurar_log()
   return Store(ARQUIVO_DADOS)
+
+
+def obter_store() -> Store:
+  """Uma instância por versão do código. Sem isso, subir código novo na nuvem reaproveitaria o
+  objeto antigo em cache (sem as chaves e regras novas) e a thread antiga continuaria rodando."""
+  return _criar_store(APP_VERSAO)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -673,6 +742,8 @@ class ResumoVarredura:
   feeds_total: int = 0
   telegram_falhas: int = 0
   erros: list[str] = field(default_factory=list)
+  duplicadas: int = 0  # mesma matéria vinda de mais de uma fonte
+  descartes: dict = field(default_factory=dict)  # motivo -> quantidade (filtro)
   em_andamento: bool = False
   quando: datetime = field(default_factory=lambda: datetime.now(FUSO_BR))
 
@@ -1113,20 +1184,190 @@ def _itens_instagram_ponte(itens: list[dict], usuario: str) -> list[dict]:
   return saida
 
 
-def consultar_instagram(usuario: str, store: "Store", forcar: bool = False) -> ResultadoFeed:
-  """Perfil do Instagram. Nunca levanta exceção e nunca insiste depois de um bloqueio."""
+# ── Instagram via Apify (Instagram Post Scraper) ─────────────────────────
+# Serviço pago por uso que lê o Instagram por trás de proxies residenciais. Mesma ideia do
+# artigo https://blog.apify.com/scrape-instagram-python/, chamando a API REST direto.
+# Controle de custo: a cobrança é por post entregue, então pedimos só os posts publicados
+# desde a última leitura bem-sucedida (onlyPostsNewerThan), em UMA execução para todos os
+# perfis, com teto por perfil e teto diário.
+APIFY_ACTOR = "nH2AHrwxeTRJoN5hX"  # apify/instagram-post-scraper
+APIFY_RUN_SYNC = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
+APIFY_USUARIO = "https://api.apify.com/v2/users/me"
+APIFY_CUSTO_POR_POST = 0.0027  # US$ por post no plano gratuito (os planos pagos têm desconto)
+_LOCK_APIFY = threading.Lock()
+
+
+def _apify_token(store: "Store") -> str:
+  return (store.data.get("apify_token") or "").strip()
+
+
+def apify_uso_hoje(store: "Store") -> int:
+  """Posts cobrados hoje (o contador reinicia à meia-noite de Brasília)."""
+  hoje = datetime.now(FUSO_BR).strftime("%Y-%m-%d")
+  with store.lock:
+    uso = store.data.get("apify_uso") or {}
+    if uso.get("dia") != hoje:
+      uso = {"dia": hoje, "posts": 0}
+      store.data["apify_uso"] = uso
+    return int(uso.get("posts", 0))
+
+
+def _erro_apify(resp, token: str) -> str:
+  try:
+    detalhe = (resp.json().get("error") or {}).get("message", "")
+  except (ValueError, AttributeError):
+    detalhe = ""
+  base = {
+      401: "Token do Apify inválido.",
+      402: "Créditos do Apify esgotados (ou limite de uso do plano atingido).",
+      403: "O token não tem permissão para rodar este serviço.",
+      404: "Serviço do Apify não encontrado.",
+      408: "O Apify demorou demais para responder.",
+      429: "Muitas requisições ao Apify. Tente de novo em instantes.",
+  }.get(resp.status_code, f"O Apify respondeu HTTP {resp.status_code}.")
+  return _mascarar(f"{base} {detalhe}".strip(), token)
+
+
+def testar_apify(token: str) -> tuple[bool, str]:
+  """Valida o token consultando a conta (não roda nenhum scraper, não gera custo)."""
+  if not token:
+    return False, "Token do Apify não configurado."
+  try:
+    resp = requests.get(APIFY_USUARIO, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+  except requests.RequestException as erro:
+    return False, _mascarar(f"Falha de conexão: {erro}", token)
+  if resp.status_code != 200:
+    return False, _erro_apify(resp, token)
+  try:
+    nome = (resp.json().get("data") or {}).get("username") or "conta Apify"
+  except ValueError:
+    nome = "conta Apify"
+  return True, f"Conectado como {nome}."
+
+
+def _executar_apify(perfis: list[str], store: "Store",
+                    janela_completa: bool) -> dict[str, ResultadoFeed]:
+  """Uma execução do scraper para a lista de perfis. Nunca levanta exceção."""
+  token = _apify_token(store)
+  por_perfil = max(1, int(store.data.get("apify_limite_perfil", 5)))
+  teto_dia = max(1, int(store.data.get("apify_limite_dia", 150)))
+  resultados = {p: ResultadoFeed(url=f"ig:{p}", exige_data=True) for p in perfis}
+
+  def falhar(mensagem: str) -> dict[str, ResultadoFeed]:
+    for r in resultados.values():
+      r.erro = mensagem
+    return resultados
+
+  restante = teto_dia - apify_uso_hoje(store)
+  if restante <= 0:
+    return falhar(f"Teto diário do Apify atingido ({teto_dia} posts). Volta amanhã, ou aumente o teto.")
+  # Só posts novos: desde a última leitura boa (+5 min de folga), nunca além de 1 hora,
+  # que é o limite do filtro. Assim cada post é cobrado ~1 vez.
+  desde = datetime.now(timezone.utc) - JANELA_MAXIMA
+  ultimo = getattr(store, "apify_ultimo_ok", None)
+  if janela_completa and ultimo:
+    desde = max(desde, datetime.fromtimestamp(ultimo, timezone.utc) - timedelta(minutes=5))
+  corpo = {
+      "username": perfis,
+      "resultsLimit": por_perfil,
+      "skipPinnedPosts": True,
+      "onlyPostsNewerThan": desde.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+  }
+  inicio = time.perf_counter()
+  try:
+    resp = requests.post(
+        APIFY_RUN_SYNC,
+        params={"timeout": 240, "maxItems": min(por_perfil * len(perfis), restante)},
+        json=corpo, headers={"Authorization": f"Bearer {token}"}, timeout=(10, 280),
+    )
+  except requests.Timeout:
+    return falhar("Tempo esgotado esperando o Apify.")
+  except requests.RequestException as erro:
+    return falhar(_mascarar(f"Falha de conexão com o Apify: {erro}", token))
+  latencia = int((time.perf_counter() - inicio) * 1000)
+  for r in resultados.values():
+    r.status, r.latencia_ms = resp.status_code, latencia
+  if resp.status_code not in (200, 201):
+    return falhar(_erro_apify(resp, token))
+  try:
+    dados = resp.json()
+  except ValueError:
+    return falhar("Resposta inválida do Apify (não é JSON).")
+  if not isinstance(dados, list):
+    return falhar("Formato inesperado na resposta do Apify.")
+
+  with store.lock:  # contabiliza o que foi cobrado (inclui entradas vazias)
+    apify_uso_hoje(store)
+    store.data["apify_uso"]["posts"] += len(dados)
+  nomes = {p.lower(): p for p in perfis}
+  for item in dados:
+    if not isinstance(item, dict):
+      continue
+    usuario = nomes.get(str(item.get("ownerUsername") or "").lower())
+    codigo = item.get("shortCode")
+    legenda = str(item.get("caption") or "").strip()
+    if not usuario or not codigo or not legenda:
+      continue
+    resultados[usuario].itens.append(
+        _item_instagram(usuario, codigo, legenda, _data_iso(item.get("timestamp"))))
+  desde_txt = desde.astimezone(FUSO_BR).strftime("%H:%M")
+  for usuario, r in resultados.items():
+    r.ok = True
+    r.titulo = f"@{usuario} via Apify (posts desde {desde_txt})"
+  if janela_completa:
+    store.apify_ultimo_ok = time.time()
+  return resultados
+
+
+def _instagram_via_apify(usuario: str, store: "Store", forcar: bool) -> ResultadoFeed:
+  """Uma execução cobre todos os perfis; os demais perfis reaproveitam o resultado."""
   chave = f"ig:{usuario}"
+  ttl = max(10, int(store.data.get("apify_intervalo_min", 20))) * 60
+  with _LOCK_APIFY:
+    anterior = store.feeds.get(chave)
+    if anterior and not forcar:
+      idade = (datetime.now(FUSO_BR) - anterior.consultado_em).total_seconds()
+      if idade < (ttl if anterior.ok else IG_INTERVALO_FALHA_S):
+        return anterior
+    falha = getattr(store, "apify_falha", None)  # não repete uma chamada que acabou de falhar
+    if falha and not forcar and time.time() - falha[0] < IG_INTERVALO_FALHA_S:
+      return ResultadoFeed(url=chave, exige_data=True, erro=falha[1])
+    todos = list(store.data["perfis_instagram"])
+    em_lote = not forcar and usuario in todos
+    resultados = _executar_apify(todos if em_lote else [usuario], store, janela_completa=em_lote)
+    for nome, res in resultados.items():
+      if res.ok:
+        store.feeds[f"ig:{nome}"] = res
+    atual = resultados[usuario]
+    store.apify_falha = None if atual.ok else (time.time(), atual.erro)
+    store.salvar()
+    return atual
+
+
+def consultar_instagram(usuario: str, store: "Store", forcar: bool = False) -> ResultadoFeed:
+  """Perfil do Instagram. Ordem: Apify (se houver token) → acesso direto → pontes RSS.
+  Nunca levanta exceção e nunca insiste depois de um bloqueio."""
+  chave = f"ig:{usuario}"
+  token_apify = _apify_token(store)
+  ttl = (max(10, int(store.data.get("apify_intervalo_min", 20))) * 60
+         if token_apify else IG_INTERVALO_OK_S)
   anterior = store.feeds.get(chave)
   if anterior and not forcar:  # evita martelar o Instagram a cada varredura
     idade = (datetime.now(FUSO_BR) - anterior.consultado_em).total_seconds()
-    if idade < (IG_INTERVALO_OK_S if anterior.ok else IG_INTERVALO_FALHA_S):
+    if idade < (ttl if anterior.ok else IG_INTERVALO_FALHA_S):
       return anterior
+  falhas: list[str] = []
+  if token_apify:
+    res = _instagram_via_apify(usuario, store, forcar)
+    if res.ok:
+      return res
+    falhas.append(f"Apify: {res.erro}")
   sessionid = (store.data.get("instagram_sessionid") or "").strip()
   with _LOCK_IG:
     res = _consultar_instagram_direto(usuario, sessionid)
   if res.ok:
     return res
-  falhas = [f"acesso direto: {res.erro}"]
+  falhas.append(f"acesso direto: {res.erro}")
   for modelo in store.data.get("bridges_instagram", []):
     url = modelo.replace("{perfil}", quote_plus(usuario))
     ponte = consultar_feed(url, proteger=True)
@@ -1294,42 +1535,119 @@ def _linha_de_base(store: Store, res: ResultadoFeed) -> None:
   cfg["baseline_feito"] = True
 
 
-def avaliar_itens(store: Store, itens: list[dict], cidades: list[str],
-                  novos: list[dict], *, exige_data: bool = False) -> None:
-  """Pipeline ÚNICO de filtragem, igual para toda fonte (RSS, X, Instagram, páginas…).
+def _origem_fonte(chave: str) -> str:
+  """rss (feed do veículo) | busca (Google News) | pagina | social."""
+  if chave.startswith(("x:", "ig:")):
+    return "social"
+  if chave.startswith("pg:"):
+    return "pagina"
+  return "busca" if "news.google.com" in chave else "rss"
 
-  Ordem: 1) janela de 1 hora  2) menção explícita a cidade/bairro/rua/rodovia
-  3) id_unico inédito (persistido em dados_monitor_g1.json). Só o que passa nas
-  três etapas vira alerta, aparece no painel e vai ao Telegram.
+
+def _tokens_titulo(titulo: str, fonte: str = "") -> frozenset:
+  """Palavras que identificam a matéria: sem veículo, acentos, pontuação e palavras vazias."""
+  limpo = re.sub(r"[^a-z0-9 ]", " ", _norm(_sem_veiculo(titulo, fonte)))
+  return frozenset(p for p in limpo.split() if len(p) >= 3 and p not in STOPWORDS_TITULO)
+
+
+def _mesma_noticia(a: frozenset, b: frozenset) -> bool:
+  if not a or not b:
+    return False
+  if a == b:
+    return True
+  if min(len(a), len(b)) < 4:  # título curto demais para comparar por aproximação
+    return False
+  return len(a & b) / len(a | b) >= SIMILARIDADE_TITULO
+
+
+def deduplicar_entre_fontes(store: "Store", novos: list[dict]) -> tuple[list[dict], int]:
+  """A mesma matéria vinda de fontes diferentes (RSS do veículo, busca do Google News…)
+  é enviada UMA vez, e a de maior prioridade vence (RSS antes de página, rede social e busca).
+  Também descarta o que repete uma matéria já enviada nas últimas horas.
+  Devolve (alertas a enviar, quantidade de duplicadas descartadas)."""
+  agora = time.time()
+  with store.lock:
+    recentes = [
+        frozenset(sig.split()) for ts, sig in store.data.get("assinaturas", [])
+        if agora - ts < JANELA_ASSINATURA_S
+    ]
+  com_assinatura = [a for a in novos if a.get("assinatura")]
+  sem_assinatura = [a for a in novos if not a.get("assinatura")]  # ex.: trens
+  com_assinatura.sort(key=lambda a: (PRIORIDADE_ORIGEM.get(a.get("origem"), 9), a["data_hora"]))
+  mantidos: list[dict] = []
+  vistos = list(recentes)
+  for alerta in com_assinatura:
+    tokens = frozenset(alerta["assinatura"].split())
+    if any(_mesma_noticia(tokens, outro) for outro in vistos):
+      continue
+    mantidos.append(alerta)
+    vistos.append(tokens)
+  with store.lock:
+    lista = store.data.setdefault("assinaturas", [])
+    lista.extend([agora, a["assinatura"]] for a in mantidos)
+    lista[:] = [par for par in lista if agora - par[0] < JANELA_ASSINATURA_S][-LIMITE_ASSINATURAS:]
+  return sem_assinatura + mantidos, len(com_assinatura) - len(mantidos)
+
+
+def veredito_texto(store: Store, texto: str, cidades: list[str] | None = None) -> dict:
+  """Decisão do filtro para um texto: cidade/rua da base + palavra-chave + sem bloqueio.
+  É a MESMA regra do pipeline e da pré-visualização na aba Fontes."""
+  d = store.data
+  bloqueada = bloqueado_por(texto, d.get("termos_bloqueados"))
+  if bloqueada:
+    return {"ok": False, "motivo": "bloqueado", "detalhe": bloqueada}
+  achado = identificar_local_detalhe(
+      texto, d["cidades"] if cidades is None else cidades, d.get("logradouros"),
+      d.get("rodovias"), d.get("cidades_excluidas"), d.get("nomes_ambiguos"))
+  if not achado:  # genérico, de outra praça ou sem menção explícita
+    return {"ok": False, "motivo": "sem cidade"}
+  categoria, palavra = classificar_detalhe(texto, d.get("termos_categorias"))
+  if categoria == CAT_GERAL and d.get("exigir_palavra_chave", True):
+    return {"ok": False, "motivo": "sem palavra-chave", "local": achado[0]}
+  return {"ok": True, "local": achado[0], "trecho": achado[1],
+          "categoria": categoria, "palavra": palavra}
+
+
+def avaliar_itens(store: Store, itens: list[dict], cidades: list[str],
+                  novos: list[dict], *, exige_data: bool = False,
+                  origem: str = "rss", descartes: dict | None = None) -> None:
+  """Pipeline ÚNICO de filtragem, igual para toda fonte (RSS, busca, X, Instagram, páginas…).
+
+  Ordem: 1) janela de 1 hora  2) palavra bloqueada  3) cidade/bairro/rua/rodovia da base
+  4) palavra-chave de alguma categoria  5) id_unico inédito (persistido).
+  O cruzamento entre fontes (mesma matéria no RSS e na busca) é feito depois, em
+  deduplicar_entre_fontes. Só o que passa em tudo vira alerta e vai ao Telegram.
   """
-  logradouros = store.data.get("logradouros")
-  rodovias = store.data.get("rodovias")
-  excluidas = store.data.get("cidades_excluidas")
-  ambiguos = store.data.get("nomes_ambiguos")
   for item in itens:
     if not item_recente(item["publicado"], not exige_data):
       continue
     texto = _texto_item(item)
     if len(texto) <= 15:
       continue
-    achado = identificar_local_detalhe(texto, cidades, logradouros, rodovias, excluidas, ambiguos)
-    if not achado:  # genérico, de outra praça ou sem menção explícita: descarta
+    v = veredito_texto(store, texto, cidades)
+    if not v["ok"]:
+      if descartes is not None:
+        descartes[v["motivo"]] = descartes.get(v["motivo"], 0) + 1
       continue
-    local, trecho = achado
     id_unico = gerar_id_unico(item.get("chave_id") or _texto_bruto(item), item["link"])
     if not store.marcar_visto(id_unico):
       continue
-    novos.append(novo_alerta(
-        id_unico=id_unico, cidade=local,
-        categoria=classificar_ocorrencia(texto), fonte=item["fonte"],
+    alerta = novo_alerta(
+        id_unico=id_unico, cidade=v["local"], categoria=v["categoria"], fonte=item["fonte"],
         titulo=item["titulo"], resumo=texto[:350], url=item["link"],
-        quando=item["publicado"], casou_com=trecho,
-    ))
+        quando=item["publicado"],
+        casou_com=f"{v['trecho']} · {v['palavra']}" if v["palavra"] else v["trecho"],
+    )
+    alerta["origem"] = origem
+    tokens = _tokens_titulo(item["titulo"], item.get("fonte", ""))
+    alerta["assinatura"] = " ".join(sorted(tokens))
+    novos.append(alerta)
 
 
 def _coletar_novos(store: Store, res: ResultadoFeed, cidades: list[str],
-                   novos: list[dict]) -> None:
-  avaliar_itens(store, res.itens, cidades, novos, exige_data=res.exige_data)
+                   novos: list[dict], descartes: dict | None = None) -> None:
+  avaliar_itens(store, res.itens, cidades, novos, exige_data=res.exige_data,
+                origem=_origem_fonte(res.url), descartes=descartes)
 
 
 def varrer_portais(store: Store) -> ResumoVarredura:
@@ -1363,7 +1681,9 @@ def varrer_portais(store: Store) -> ResumoVarredura:
       resumo.feeds_ok += 1
       if res.url.startswith("pg:"):
         _linha_de_base(store, res)
-      _coletar_novos(store, res, cidades, novos)
+      _coletar_novos(store, res, cidades, novos, resumo.descartes)
+    # Mesma matéria no RSS do veículo e na busca do Google News: envia só uma, preferindo o RSS
+    novos, resumo.duplicadas = deduplicar_entre_fontes(store, novos)
     _fechar_varredura(store, resumo, novos)
   except Exception as erro:
     log.exception("Falha na varredura")
@@ -1380,8 +1700,11 @@ class Automacao:
   """Uma única thread por processo. Continua rodando com o navegador fechado
   e sem congelar a interface (a versão anterior usava time.sleep na página)."""
 
-  def __init__(self, store: Store):
+  def __init__(self, store: Store, versao: str = ""):
     self.store = store
+    self.versao = versao
+    self.registro = _geracao_ativa()
+    self.registro["versao"] = versao  # avisa as threads de versões anteriores para encerrarem
     self.ultimo_fim: float | None = None
     self.ultimo_resumo: ResumoVarredura | None = None
     self._thread = threading.Thread(
@@ -1413,6 +1736,9 @@ class Automacao:
   def _loop(self) -> None:
     while True:
       time.sleep(2)
+      if self.registro.get("versao") != self.versao:  # há código mais novo rodando
+        log.info("Varredura automática da versão %s encerrada (substituída).", self.versao)
+        return
       try:
         proxima = self.proxima
         if proxima is not None and time.time() >= proxima:
@@ -1422,8 +1748,12 @@ class Automacao:
 
 
 @st.cache_resource(show_spinner=False)
+def _criar_automacao(versao: str) -> Automacao:
+  return Automacao(obter_store(), versao)
+
+
 def obter_automacao() -> Automacao:
-  return Automacao(obter_store())
+  return _criar_automacao(APP_VERSAO)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1651,13 +1981,16 @@ def _card_html(alerta: dict) -> str:
   marcador = '<span class="g1-urgente"></span>' if categoria == CAT_SEGURANCA else ""
   titulo = alerta.get("titulo") or alerta.get("resumo", "")[:90] or "Sem título"
   motivo = alerta.get("casou_com")
-  chip_motivo = (f'<span class="g1-chip" title="Trecho que passou no filtro geográfico">'
+  chip_motivo = (f'<span class="g1-chip" title="Local e palavra-chave que passaram no filtro">'
                  f'🔎 {esc(motivo)}</span>' if motivo else "")
+  rotulo_origem = {"rss": "RSS", "busca": "Busca"}.get(alerta.get("origem", ""), "")
+  chip_origem = (f'<span class="g1-chip" title="Tipo de fonte do link enviado">'
+                 f'🔗 {rotulo_origem}</span>' if rotulo_origem else "")
   return _html(f"""
     <div class="g1-meta">{marcador}
       <span class="g1-chip {classe_cat}">{esc(categoria)}</span>
       <span class="g1-chip">🏙️ {esc(alerta.get("cidade", ""))}</span>{chip_motivo}
-      <span class="g1-chip">📰 {esc(alerta.get("fonte", "Portal de Notícias"))}</span>
+      <span class="g1-chip">📰 {esc(alerta.get("fonte", "Portal de Notícias"))}</span>{chip_origem}
       <span class="g1-time">⏰ {esc(alerta.get("horario", ""))}</span>
     </div>
     <a class="g1-title" href="{esc(alerta.get("url", "#"), quote=True)}" target="_blank" rel="noopener">{esc(titulo)}</a>
@@ -1672,6 +2005,14 @@ def _mostrar_resumo(resumo: ResumoVarredura) -> None:
     st.success(f"{resumo.novos} novo(s) alerta(s) capturado(s).")
   else:
     st.info("Varredura concluída. Sem novidades no momento.")
+  if resumo.duplicadas:
+    st.caption(f"🔁 {resumo.duplicadas} matéria(s) repetida(s) entre fontes foram enviadas uma só vez.")
+  if resumo.descartes:
+    rotulos = {"sem cidade": "sem cidade/local da base", "sem palavra-chave": "sem palavra-chave",
+               "bloqueado": "palavra bloqueada"}
+    with st.expander("🧹 O que o filtro descartou nesta varredura"):
+      for motivo, qtd in sorted(resumo.descartes.items(), key=lambda kv: -kv[1]):
+        st.caption(f"• {qtd} item(ns): {rotulos.get(motivo, motivo)}")
   if resumo.telegram_falhas:
     st.warning(
         f"{resumo.telegram_falhas} mensagem(ns) não chegou(aram) ao Telegram."
@@ -1787,7 +2128,10 @@ def _linhas(texto: str) -> list[str]:
 
 def _testar_todos(store: Store) -> None:
   with ThreadPoolExecutor(max_workers=4) as pool:
-    for res in pool.map(lambda c: consultar_fonte(c, store, forcar=True), _fontes_ativas(store)):
+    # Instagram não é forçado aqui: com o Apify, cada teste forçado é uma execução cobrada.
+    # Para testar um perfil do Instagram na hora, use o botão "Testar" do próprio perfil.
+    for res in pool.map(lambda c: consultar_fonte(c, store, forcar=not c.startswith("ig:")),
+                        _fontes_ativas(store)):
       store.feeds[res.url] = res
 
 
@@ -1812,21 +2156,25 @@ def _cartao_fonte(store: Store, chave: str, titulo: str, detalhe: str = "",
       if not res.ok:
         st.error(res.erro)
       for item in res.itens[:8]:
-        local = identificar_local(
-            _texto_item(item), store.data["cidades"], store.data["logradouros"],
-            store.data["rodovias"], store.data["cidades_excluidas"],
-            store.data["nomes_ambiguos"],
-        )
+        v = veredito_texto(store, _texto_item(item))
+        if v["ok"]:
+          filtro = f"✅ {v['local']} · {v['categoria']}"
+        elif v["motivo"] == "bloqueado":
+          filtro = f"⛔ palavra bloqueada: {v['detalhe']}"
+        elif v["motivo"] == "sem palavra-chave":
+          filtro = f"⚠️ {v['local']}, mas sem palavra-chave (seria descartada)"
+        else:
+          filtro = "⚠️ fora da base (seria descartada)"
         selo = "🟢" if item_recente(item["publicado"], not res.exige_data) else "⚪"
         nome = html.escape(item["titulo"] or "(sem título)")
         nome = re.sub(r"([\[\]])", r"\\\1", nome)
         st.markdown(
             f"{selo} [{nome}]({item['link']})  \n"
             f"<small>{html.escape(item['fonte'])} · {idade_texto(item['publicado'])} · "
-            f"🏙️ {html.escape(local) if local else 'fora da base (seria descartada)'}</small>",
+            f"{html.escape(filtro)}</small>",
             unsafe_allow_html=True)
       if res.itens:
-        st.caption("🟢 dentro da janela de 1 hora · ⚪ fora da janela · 🏙️ resultado do filtro geográfico")
+        st.caption("🟢 dentro da janela de 1 hora · ⚪ fora da janela · ✅/⚠️/⛔ resultado do filtro")
     b1, b2, _ = st.columns([1, 1, 3])
     if b1.button("🔄 Testar", key=f"teste_{_k(chave)}"):
       with st.spinner("Testando…"):
@@ -1859,6 +2207,10 @@ def _resumo_fontes(store: Store) -> None:
 
 
 def _sub_rss(store: Store) -> None:
+  st.caption(
+      "Feeds de veículos (RSS) e feeds de busca (Google News) se complementam: quando a mesma matéria "
+      "aparece nos dois, só uma é enviada e o link do RSS tem preferência. A comparação é pelo título."
+  )
   with st.form("form_url", clear_on_submit=True):
     nova = st.text_input("Endereço do feed", placeholder="https://…/rss")
     if st.form_submit_button("Adicionar feed", type="primary"):
@@ -1878,7 +2230,9 @@ def _sub_rss(store: Store) -> None:
   if not store.data["urls"]:
     st.info("Nenhum feed RSS cadastrado.")
   for url in list(store.data["urls"]):
-    _cartao_fonte(store, url, rotulo_feed(url), url, (store.remover_item, "urls", url))
+    tipo = ("🔍 Busca (Google News): complementa os feeds RSS dos veículos\n"
+            if _origem_fonte(url) == "busca" else "📰 RSS direto do veículo (tem preferência)\n")
+    _cartao_fonte(store, url, rotulo_feed(url), tipo + url, (store.remover_item, "urls", url))
 
 
 def _sub_x(store: Store) -> None:
@@ -1920,10 +2274,53 @@ def _sub_x(store: Store) -> None:
 
 def _sub_instagram(store: Store) -> None:
   st.caption(
-      "O Instagram bloqueia leitura anônima com frequência. O painel lê com cabeçalhos de navegador, "
-      "espaça as consultas (no máximo uma a cada 10 min por perfil) e pausa 15 min sozinho se for "
-      "bloqueado. A forma mais estável é informar o cookie de sessão de uma conta secundária, abaixo."
+      "Ordem de leitura: 1) Apify, se houver token (o mais estável); 2) acesso direto, que o Instagram "
+      "costuma bloquear; 3) pontes RSS de reserva. Cada perfil mostra abaixo qual caminho funcionou."
   )
+  with st.expander("☁️ Apify (recomendado): serviço que lê o Instagram sem ser bloqueado",
+                   expanded=not _apify_token(store)):
+    st.caption(
+        "O Instagram bloqueia leitura feita por script, principalmente a partir de servidores. O "
+        "Apify é um serviço pago por uso que faz a leitura por você. O painel pede só os posts "
+        "novos desde a última leitura, então cada post é cobrado cerca de uma vez. No plano "
+        "gratuito há US$ 5 de crédito por mês (≈ 1.800 posts a US$ 2,70 por 1.000). Para criar o "
+        "token: console.apify.com → Settings → API & Integrations."
+    )
+    externo_apify = "apify_token" in store.externos
+    if externo_apify:
+      st.success("🔒 O token vem dos Secrets da plataforma (APIFY_TOKEN).")
+    with st.form("form_apify"):
+      if not externo_apify:
+        token_novo = st.text_input("Token do Apify", value=store.data.get("apify_token", ""),
+                                   type="password")
+      a1, a2, a3 = st.columns(3)
+      lim_perfil = a1.number_input("Posts por perfil (máx.)", 1, 20,
+                                   value=int(store.data.get("apify_limite_perfil", 5)),
+                                   help="Teto de posts por perfil em cada leitura.")
+      intervalo = a2.number_input("Intervalo (min)", 10, 180,
+                                  value=int(store.data.get("apify_intervalo_min", 20)),
+                                  help="De quanto em quanto tempo consultar. O custo depende dos posts "
+                                       "novos, não do número de consultas.")
+      teto = a3.number_input("Teto diário (posts)", 10, 5000,
+                             value=int(store.data.get("apify_limite_dia", 150)),
+                             help="Trava de segurança: ao atingir, o painel para de usar o Apify até o dia seguinte.")
+      if st.form_submit_button("Salvar configurações do Apify", type="primary"):
+        with store.lock:
+          if not externo_apify:
+            store.data["apify_token"] = token_novo.strip()
+          store.data["apify_limite_perfil"] = int(lim_perfil)
+          store.data["apify_intervalo_min"] = int(intervalo)
+          store.data["apify_limite_dia"] = int(teto)
+          store.apify_falha = None
+          store.salvar()
+        st.success("Configurações salvas.")
+    usados = apify_uso_hoje(store)
+    st.caption(f"Hoje: {usados} post(s) cobrado(s) ≈ US$ {usados * APIFY_CUSTO_POR_POST:.2f} "
+               f"(estimativa no plano gratuito; teto diário de {store.data.get('apify_limite_dia', 150)}). "
+               "Confira o gasto real no painel de uso do Apify.")
+    if st.button("Testar conexão com o Apify", key="btn_testa_apify"):
+      ok, msg = testar_apify(_apify_token(store))
+      (st.success if ok else st.error)(msg)
   with st.form("form_ig", clear_on_submit=True):
     novo = st.text_input("Novo perfil do Instagram", placeholder="Ex.: diariodesuzano ou link do perfil")
     if st.form_submit_button("Adicionar perfil", type="primary"):
@@ -2047,15 +2444,55 @@ def _sub_locais(store: Store) -> None:
         st.success(f"Salvo: {len(store.data['logradouros'])} ruas/bairros e {len(store.data['rodovias'])} rodovias.")
 
 
+def _restaurar_palavras() -> None:
+  store = obter_store()
+  with store.lock:
+    store.data["termos_categorias"] = copy.deepcopy(TERMOS_CATEGORIAS)
+    store.data["termos_bloqueados"] = list(TERMOS_BLOQUEADOS_PADRAO)
+    store.data["exigir_palavra_chave"] = True
+    store.salvar()
+
+
+def _sub_palavras(store: Store) -> None:
+  st.caption(
+      "Um alerta só é criado quando o texto cita uma cidade ou local da base E contém ao menos uma "
+      "palavra-chave de alguma categoria abaixo. Palavras bloqueadas descartam o texto mesmo que ele "
+      "cite uma cidade. Um termo por linha; vale a palavra inteira, sem diferenciar maiúsculas e acentos."
+  )
+  with st.form("form_palavras"):
+    exigir = st.checkbox(
+        "Exigir palavra-chave (recomendado)", value=bool(store.data.get("exigir_palavra_chave", True)),
+        help="Desligado, notícias que citam a cidade mas não têm nenhuma palavra-chave "
+             "entram como “Nota Oficial / Geral”.")
+    termos = store.data["termos_categorias"]
+    novos_termos = {}
+    colunas = st.columns(3)
+    for coluna, categoria in zip(colunas, list(TERMOS_CATEGORIAS)):
+      novos_termos[categoria] = coluna.text_area(
+          categoria, value="\n".join(termos.get(categoria, [])), height=320)
+    bloqueadas = st.text_area(
+        "Palavras bloqueadas (assuntos que não interessam)",
+        value="\n".join(store.data["termos_bloqueados"]), height=120)
+    if st.form_submit_button("Salvar palavras", type="primary"):
+      with store.lock:
+        store.data["exigir_palavra_chave"] = bool(exigir)
+        store.data["termos_categorias"] = {c: _linhas(t) for c, t in novos_termos.items()}
+        store.data["termos_bloqueados"] = _linhas(bloqueadas)
+        store.salvar()
+      st.success("Palavras salvas.")
+  st.button("↩️ Restaurar palavras padrão", on_click=_restaurar_palavras, key="btn_restaura_palavras")
+
+
 def aba_fontes(store: Store) -> None:
   """Tudo sobre fontes num só lugar: cadastro, status ao vivo e base geográfica."""
   _resumo_fontes(store)
-  t_rss, t_x, t_ig, t_pg, t_loc = st.tabs([
+  t_rss, t_x, t_ig, t_pg, t_loc, t_kw = st.tabs([
       f"🔗 Feeds RSS ({len(store.data['urls'])})",
       f"𝕏 X ({len(store.data['perfis_x'])})",
       f"📸 Instagram ({len(store.data['perfis_instagram'])})",
       f"🌐 Páginas e canais ({len(store.data['paginas'])})",
       "🏙️ Cidades e locais",
+      "🔎 Palavras-chave",
   ])
   with t_rss:
     _sub_rss(store)
@@ -2067,6 +2504,8 @@ def aba_fontes(store: Store) -> None:
     _sub_paginas(store)
   with t_loc:
     _sub_locais(store)
+  with t_kw:
+    _sub_palavras(store)
 
 
 def _salvar_automacao() -> None:
